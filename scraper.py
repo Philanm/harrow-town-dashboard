@@ -58,33 +58,33 @@ logger = logging.getLogger("htcc_scraper")
 POINTS = {
     # Batting
     "per_run": 1,
-    "per_four": 1,
-    "per_six": 2,
-    "milestone_25": 5,
-    "milestone_50": 10,
-    "milestone_100": 25,
-    "not_out": 5,
-    "duck": -3,
-    "sr_150_bonus": 10,       # SR >= 150, min 10 balls
-    "sr_100_bonus": 5,        # SR >= 100, min 10 balls
-    "sr_50_penalty": -5,      # SR < 50,  min 10 balls
-    "sr_min_balls": 10,
+    "per_four": 2,
+    "per_six": 4,
+    "milestone_25": 10,
+    "milestone_50": 20,
+    "milestone_100": 40,
+    "not_out": 5,             # Only awarded if 30+ runs
+    "not_out_min_runs": 30,
+    "duck": -5,               # Dismissed for 0
+    "run_out_batting": -8,    # Penalty for being run out
 
     # Bowling
-    "per_wicket": 20,
-    "haul_3w": 5,
-    "haul_5w": 20,
-    "per_maiden": 3,
-    "economy_lt4": 15,        # Economy < 4, min 4 overs
-    "economy_lt5": 10,        # Economy < 5, min 4 overs
-    "economy_lt6": 5,         # Economy < 6, min 4 overs
-    "economy_gte10": -5,      # Economy >= 10, min 4 overs
+    "per_wicket": 25,
+    "haul_3w": 10,
+    "haul_5w": 25,
+    "per_maiden": 5,
+    "per_wide": -1,
+    "per_no_ball": -2,
+    "economy_7_to_8": -2,    # Economy 7.00-7.99
+    "economy_8_to_9": -3,    # Economy 8.00-8.99
+    "economy_9_to_10": -5,   # Economy 9.00-9.99
+    "economy_gte10": -8,     # Economy >= 10
     "econ_min_overs": 4,
 
     # Fielding
     "catch": 10,
     "run_out": 10,
-    "stumping": 12,
+    "stumping": 10,
 }
 
 
@@ -198,10 +198,10 @@ def calc_batting_points(batting):
     runs = int(batting.get("runs", 0) or 0)
     fours = int(batting.get("fours", 0) or 0)
     sixes = int(batting.get("sixes", 0) or 0)
-    balls = int(batting.get("balls", 0) or 0)
     how_out = str(batting.get("how_out", "")).strip().lower()
     is_not_out = how_out in ("not out", "retired not out", "retired hurt")
     is_duck = runs == 0 and not is_not_out and how_out not in ("dnb", "did not bat", "absent", "")
+    is_run_out = "run out" in how_out
 
     pts = 0
     pts += runs * POINTS["per_run"]
@@ -216,20 +216,16 @@ def calc_batting_points(batting):
     elif runs >= 25:
         pts += POINTS["milestone_25"]
 
-    if is_not_out:
+    # Not out bonus only if 30+ runs
+    if is_not_out and runs >= POINTS["not_out_min_runs"]:
         pts += POINTS["not_out"]
+
     if is_duck:
         pts += POINTS["duck"]
 
-    # Strike rate bonuses (min 10 balls faced)
-    if balls >= POINTS["sr_min_balls"]:
-        sr = (runs / balls) * 100
-        if sr >= 150:
-            pts += POINTS["sr_150_bonus"]
-        elif sr >= 100:
-            pts += POINTS["sr_100_bonus"]
-        elif sr < 50:
-            pts += POINTS["sr_50_penalty"]
+    # Run out penalty (for the batter who was run out)
+    if is_run_out:
+        pts += POINTS["run_out_batting"]
 
     return pts
 
@@ -239,6 +235,8 @@ def calc_bowling_points(bowling):
     wickets = int(bowling.get("wickets", 0) or 0)
     maidens = int(bowling.get("maidens", 0) or 0)
     runs = int(bowling.get("runs", 0) or 0)
+    wides = int(bowling.get("wides", 0) or 0)
+    no_balls = int(bowling.get("no_balls", 0) or 0)
     overs_str = str(bowling.get("overs", "0") or "0")
     overs_float = parse_overs_to_float(overs_str)
 
@@ -253,17 +251,21 @@ def calc_bowling_points(bowling):
 
     pts += maidens * POINTS["per_maiden"]
 
-    # Economy bonuses (min 4 overs)
+    # Wides and no-balls penalties
+    pts += wides * POINTS["per_wide"]
+    pts += no_balls * POINTS["per_no_ball"]
+
+    # Economy penalties (min 4 overs, penalties only — no bonuses)
     if overs_float >= POINTS["econ_min_overs"]:
         economy = runs / overs_float if overs_float > 0 else 99
-        if economy < 4:
-            pts += POINTS["economy_lt4"]
-        elif economy < 5:
-            pts += POINTS["economy_lt5"]
-        elif economy < 6:
-            pts += POINTS["economy_lt6"]
-        elif economy >= 10:
+        if economy >= 10:
             pts += POINTS["economy_gte10"]
+        elif economy >= 9:
+            pts += POINTS["economy_9_to_10"]
+        elif economy >= 8:
+            pts += POINTS["economy_8_to_9"]
+        elif economy >= 7:
+            pts += POINTS["economy_7_to_8"]
 
     return pts
 
@@ -623,13 +625,16 @@ def run_weekly():
 
     logger.info(f"Found teams: {teams}")
 
-    # Calculate last Saturday's date (most recent match day)
+    # Calculate the weekend window (Friday to Monday)
+    # This catches Saturday matches, Sunday matches, and any rescheduled games
     today = datetime.now()
     days_since_saturday = (today.weekday() + 2) % 7  # Monday=0, Saturday=5
     last_saturday = today - timedelta(days=days_since_saturday)
+    weekend_start = (last_saturday - timedelta(days=1)).strftime("%d/%m/%Y")  # Friday
+    weekend_end = (last_saturday + timedelta(days=2)).strftime("%d/%m/%Y")    # Monday
     match_date = last_saturday.strftime("%d/%m/%Y")
 
-    logger.info(f"Looking for matches on: {match_date}")
+    logger.info(f"Looking for matches between: {weekend_start} and {weekend_end}")
 
     weekly_results = []
 
@@ -637,22 +642,16 @@ def run_weekly():
         logger.info(f"\n{'='*50}")
         logger.info(f"Processing {team_label} (ID: {team_id})")
 
-        # Get matches for this team around last Saturday
+        # Search the full weekend window (Fri-Mon) to catch all fixtures
         matches = get_matches(
             season=SEASON,
             team_id=team_id,
-            from_date=match_date,
-            end_date=match_date,
+            from_date=weekend_start,
+            end_date=weekend_end,
         )
 
         if not matches:
-            # Try a wider window (Fri-Sun) in case of rescheduling
-            fri = (last_saturday - timedelta(days=1)).strftime("%d/%m/%Y")
-            sun = (last_saturday + timedelta(days=1)).strftime("%d/%m/%Y")
-            matches = get_matches(season=SEASON, team_id=team_id, from_date=fri, end_date=sun)
-
-        if not matches:
-            logger.warning(f"No matches found for {team_label} on {match_date}")
+            logger.warning(f"No matches found for {team_label} between {weekend_start} and {weekend_end}")
             continue
 
         # Take the most recent match
